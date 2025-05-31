@@ -44,7 +44,7 @@ struct ContentView: View {
                     .onAppear {
                         // Debounce slider updates to prevent rapid processing
                         debounceSubject
-                            .debounce(for: .milliseconds(100), scheduler: DispatchQueue.main)
+                            .debounce(for: .milliseconds(200), scheduler: DispatchQueue.main)
                             .sink { value in
                                 updateImage(distortionStrength: value)
                             }
@@ -124,13 +124,24 @@ class MetalProcessor {
     static let device = MTLCreateSystemDefaultDevice()!
     static let commandQueue = device.makeCommandQueue()!
     static let library = device.makeDefaultLibrary()!
-    static let kernel = library.makeFunction(name: "distortionCorrection")!
-    static let pipelineState: MTLComputePipelineState = {
-        try! device.makeComputePipelineState(function: kernel)
+    static let mappingKernel = library.makeFunction(name: "generateMapping")!
+    static let applyKernel = library.makeFunction(name: "applyMapping")!
+    static let mappingPipelineState: MTLComputePipelineState = {
+        try! device.makeComputePipelineState(function: mappingKernel)
+    }()
+    static let applyPipelineState: MTLComputePipelineState = {
+        try! device.makeComputePipelineState(function: applyKernel)
     }()
     static let ciContext = CIContext(mtlDevice: device, options: [.cacheIntermediates: false]) // Reusable CIContext
+    struct CameraMatrix {
+        var fx: Float
+        var fy: Float
+        var cx: Float
+        var cy: Float
+    }
     
     static func processImage(_ inputCGImage: CGImage, distortionStrength: Float) -> CGImage? {
+        var distortionStrength = distortionStrength;
         // Create Metal texture from CGImage
         let textureLoader = MTKTextureLoader(device: device)
         guard let inputTexture = try? textureLoader.newTexture(cgImage: inputCGImage, options: nil) else {
@@ -139,42 +150,79 @@ class MetalProcessor {
         }
         
         // Create output texture
-        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+        let mappingDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rg32Float, // Store UV as float2
+            width: inputTexture.width,
+            height: inputTexture.height,
+            mipmapped: false
+        )
+        mappingDescriptor.usage = [.shaderRead, .shaderWrite]
+        guard let mappingTexture = device.makeTexture(descriptor: mappingDescriptor) else {
+            print("Failed to create mapping texture")
+            return nil
+        }
+        
+        // Create output texture
+        let outputDescriptor = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: inputTexture.pixelFormat,
             width: inputTexture.width,
             height: inputTexture.height,
             mipmapped: false
         )
-        descriptor.usage = [.shaderRead, .shaderWrite]
-        guard let outputTexture = device.makeTexture(descriptor: descriptor) else {
+        
+        outputDescriptor.usage = [.shaderRead, .shaderWrite]
+        guard let outputTexture = device.makeTexture(descriptor: outputDescriptor) else {
             print("Failed to create output texture")
             return nil
         }
         
         // Create command buffer
-        guard let commandBuffer = commandQueue.makeCommandBuffer(),
-              let commandEncoder = commandBuffer.makeComputeCommandEncoder() else {
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            print("Failed to create command buffer")
             return nil
         }
         
-        // Set pipeline and textures
-        commandEncoder.setComputePipelineState(pipelineState)
-        commandEncoder.setTexture(inputTexture, index: 0)
-        commandEncoder.setTexture(outputTexture, index: 1)
+        // First pass: Generate mapping
+        if let mappingEncoder = commandBuffer.makeComputeCommandEncoder() {
+            mappingEncoder.setComputePipelineState(mappingPipelineState)
+            mappingEncoder.setTexture(mappingTexture, index: 0)
+            mappingEncoder.setBytes(&distortionStrength, length: MemoryLayout<Float>.size, index: 0)
+            
+            // Set camera matrix (matches OpenCV)
+            var cameraMatrix = CameraMatrix(
+                fx: Float(inputTexture.width), // focal_length = width
+                fy: Float(inputTexture.width), // Same for simplicity
+                cx: Float(inputTexture.width) / 2.0,
+                cy: Float(inputTexture.height) / 2.0
+            )
+            mappingEncoder.setBytes(&cameraMatrix, length: MemoryLayout<CameraMatrix>.size, index: 1)
+            
+            let threadgroupSize = MTLSize(width: 16, height: 16, depth: 1)
+            let threadgroupCount = MTLSize(
+                width: (inputTexture.width + threadgroupSize.width - 1) / threadgroupSize.width,
+                height: (inputTexture.height + threadgroupSize.height - 1) / threadgroupSize.height,
+                depth: 1
+            )
+            mappingEncoder.dispatchThreadgroups(threadgroupCount, threadsPerThreadgroup: threadgroupSize)
+            mappingEncoder.endEncoding()
+        }
         
-        // Set distortion strength
-        var distortionStrength = distortionStrength
-        commandEncoder.setBytes(&distortionStrength, length: MemoryLayout<Float>.size, index: 0)
-        
-        // Dispatch threads
-        let threadgroupSize = MTLSize(width: 16, height: 16, depth: 1)
-        let threadgroupCount = MTLSize(
-            width: (inputTexture.width + threadgroupSize.width - 1) / threadgroupSize.width,
-            height: (inputTexture.height + threadgroupSize.height - 1) / threadgroupSize.height,
-            depth: 1
-        )
-        commandEncoder.dispatchThreadgroups(threadgroupCount, threadsPerThreadgroup: threadgroupSize)
-        commandEncoder.endEncoding()
+        // Second pass: Apply mapping
+        if let applyEncoder = commandBuffer.makeComputeCommandEncoder() {
+            applyEncoder.setComputePipelineState(applyPipelineState)
+            applyEncoder.setTexture(inputTexture, index: 0)
+            applyEncoder.setTexture(mappingTexture, index: 1)
+            applyEncoder.setTexture(outputTexture, index: 2)
+            
+            let threadgroupSize = MTLSize(width: 16, height: 16, depth: 1)
+            let threadgroupCount = MTLSize(
+                width: (inputTexture.width + threadgroupSize.width - 1) / threadgroupSize.width,
+                height: (inputTexture.height + threadgroupSize.height - 1) / threadgroupSize.height,
+                depth: 1
+            )
+            applyEncoder.dispatchThreadgroups(threadgroupCount, threadsPerThreadgroup: threadgroupSize)
+            applyEncoder.endEncoding()
+        }
         
         // Commit and wait
         commandBuffer.commit()
