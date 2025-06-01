@@ -80,9 +80,6 @@ kernel void applyMapping(
     float4 mapping = mappingTexture.read(gid);
     float2 sourceUV = mapping.xy;
     
-    // Flip Y for sampling (match Metal's texture orientation)
-    sourceUV.y = 1.0 - sourceUV.y;
-    
     // Sample input texture if UV is valid
     if (sourceUV.x >= 0.0 && sourceUV.x <= 1.0 && sourceUV.y >= 0.0 && sourceUV.y <= 1.0) {
         float4 color = inputTexture.read(uint2(sourceUV.x * float(width), sourceUV.y * float(height)));
