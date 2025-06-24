@@ -12,6 +12,8 @@ struct ContentView: View {
     @State private var distortionStrength: Float = 0.0 // Single parameter (-1.0 to 1.0)
     @State private var debounceSubject = PassthroughSubject<Float, Never>()
     @State private var cancellables = Set<AnyCancellable>()
+    @State private var assetLocalIdentifier: String? // Store PHAsset identifier
+    @State private var showingPermissionAlert: Bool = false
     
     var body: some View {
         VStack {
@@ -38,24 +40,41 @@ struct ContentView: View {
                 Slider(value: $distortionStrength, in: -2.0...2.0, step: 0.1)
                     .padding()
                     .onChange(of: distortionStrength) { newValue in
-                                            debounceSubject.send(newValue)
-                                        }
-                                }
-                    .onAppear {
-                        // Debounce slider updates to prevent rapid processing
-                        debounceSubject
-                            .debounce(for: .milliseconds(200), scheduler: DispatchQueue.main)
-                            .sink { value in
-                                updateImage(distortionStrength: value)
-                            }
-                            .store(in: &cancellables)
+                        debounceSubject.send(newValue)
+                    }
+            }.onAppear {
+                checkPhotoLibraryPermission { _ in }
+                // Debounce slider updates to prevent rapid processing
+                debounceSubject
+                    .debounce(for: .milliseconds(200), scheduler: DispatchQueue.main)
+                    .sink { value in
+                        updateImage(distortionStrength: value)
+                    }
+                    .store(in: &cancellables)
             }
             
             // Photo picker and save button
-            PhotosPicker("Select Image", selection: $selectedItem, matching: .images)
+            PhotosPicker("Select Image", selection: $selectedItem,
+                         matching: .images,
+                         photoLibrary: .shared())
                 .padding()
                 .onChange(of: selectedItem) { newItem in
-                    loadImage(from: newItem)
+                    checkPhotoLibraryPermission { authorized in
+                        if authorized {
+                            loadImage(from: newItem)
+                        } else {
+                            showingPermissionAlert = true
+                        }
+                    }
+                }.alert("Photos Access Required", isPresented: $showingPermissionAlert) {
+                    Button("Open Settings") {
+                        if let settingsURL = URL(string: UIApplication.openSettingsURLString) {
+                            UIApplication.shared.open(settingsURL)
+                        }
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("Please grant Photos access in Settings to select images.")
                 }
             
             Button("Save Corrected Image") {
@@ -70,19 +89,71 @@ struct ContentView: View {
         .padding()
     }
     
+    // Check and request Photos library permission
+    func checkPhotoLibraryPermission(completion: @escaping (Bool) -> Void) {
+        let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        print("Photos access granted: \(status == .limited ? "Limited" : "Full")")
+        switch status {
+        case .authorized, .limited:
+            completion(true)
+        case .notDetermined:
+            PHPhotoLibrary.requestAuthorization(for: .readWrite) { newStatus in
+                DispatchQueue.main.async {
+                    let authorized = newStatus == .authorized || newStatus == .limited
+                    print("New permission status: \(newStatus.rawValue)")
+                    if newStatus == .limited {
+                        // Optionally present limited library picker
+                        if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+                           let rootVC = windowScene.windows.first?.rootViewController {
+                            PHPhotoLibrary.shared().presentLimitedLibraryPicker(from: rootVC)
+                        }
+                    }
+                    completion(authorized)
+                }
+            }
+        case .denied, .restricted:
+            print("Photos access denied or restricted")
+            completion(false)
+        @unknown default:
+            completion(false)
+        }
+    }
+
     func loadImage(from item: PhotosPickerItem?) {
-        guard let item = item else { return }
+        distortionStrength = 0.0;
+        
+        guard let item = item else {
+            assetLocalIdentifier = nil
+            inputImage = nil
+            correctedImage = nil
+            return
+        }
+        
         item.loadTransferable(type: Data.self) { result in
             switch result {
             case .success(let data):
                 if let data = data, let uiImage = UIImage(data: data) {
                     DispatchQueue.main.async {
                         inputImage = uiImage
+                        
                         updateImage(distortionStrength: distortionStrength)
                     }
                 }
             case .failure(let error):
                 print("Error loading image: \(error)")
+            }
+        }
+        
+        // Get the asset identifier
+        if let assetId = item.itemIdentifier {
+            assetLocalIdentifier = assetId
+            
+            // Verify we can fetch the asset
+            let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [assetId], options: nil)
+            if let asset = fetchResult.firstObject {
+                print("Successfully retrieved asset: \(asset.localIdentifier)")
+                print("Asset creation date: \(asset.creationDate ?? Date())")
+                print("Asset media type: \(asset.mediaType.rawValue)")
             }
         }
     }
@@ -100,20 +171,48 @@ struct ContentView: View {
     }
     
     func saveImage() {
+        let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [assetLocalIdentifier!], options: nil)
+        guard let originalAsset = fetchResult.firstObject else { return }
         guard let correctedImage = correctedImage else { return }
+        
         PHPhotoLibrary.requestAuthorization { status in
             if status == .authorized {
-                PHPhotoLibrary.shared().performChanges {
-                    PHAssetCreationRequest.forAsset().addResource(with: .photo, data: correctedImage.jpegData(compressionQuality: 1.0)!, options: nil)
-                } completionHandler: { success, error in
-                    DispatchQueue.main.async {
-                        if success {
-                            print("Image saved to Photos")
-                        } else if let error = error {
-                            print("Error saving image: \(error)")
+                originalAsset.requestContentEditingInput(with: nil) { contentEditingInput, info in
+                    guard let editedImageData = correctedImage.jpegData(compressionQuality:0.95) else { return }
+                    guard let input = contentEditingInput else { return }
+                    
+                    let output = PHContentEditingOutput(contentEditingInput: input)
+                    do {
+                        try editedImageData.write(to: output.renderedContentURL)
+                    } catch {
+                        DispatchQueue.main.async {
+                            print("Could not write edited image")
+                        }
+                        return
+                    }
+                    
+                    let adjustmentData = PHAdjustmentData(
+                        formatIdentifier: "com.yourapp.photoeditor",
+                        formatVersion: "1.0",
+                        data: "Custom edit applied".data(using: .utf8)!
+                    )
+                    output.adjustmentData = adjustmentData
+                    print(output.renderedContentURL)
+                    
+                    PHPhotoLibrary.shared().performChanges {
+                        let changeRequest = PHAssetChangeRequest(for: originalAsset)
+                        changeRequest.contentEditingOutput = output
+                    } completionHandler: { success, error in
+                        DispatchQueue.main.async {
+                            if success {
+                                print("Image saved to Photos")
+                            } else if let error = error {
+                                print("Error saving image: \(error)")
+                            }
                         }
                     }
                 }
+                
             }
         }
     }
